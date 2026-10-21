@@ -24,6 +24,7 @@ const (
 	CollaboratorNoHours        Reason = "collaborator_no_hours"
 	ProcessingTimeout          Reason = "processing_timeout"
 	DisallowedHackatimeProject Reason = "disallowed_hackatime_project"
+	HackatimeAccountNotFound   Reason = "hackatime_account_not_found"
 )
 
 type Wording struct {
@@ -77,6 +78,8 @@ func noteToMaker(in Input) string {
 		return "We couldn't finish processing your submission in time, so it was auto-rejected. That's usually a hiccup on our side or a slow repository host - just resubmit."
 	case DisallowedHackatimeProject:
 		return "The <<LAST_PROJECT>> Hackatime project is not allowed to be used for shipping in YSWS programs, and it was the only Hackatime project on this submission. Track your time under a real project name on Hackatime, then ship again with that project attached."
+	case HackatimeAccountNotFound:
+		return "We couldn't find a Hackatime account for " + names + ". Everyone on a collaborative ship needs their own time on Hackatime, journals, or timelapses. If they tracked time on Hackatime, make sure their Hackatime account uses the email on the submission or is linked to their Slack account, then ship again."
 	}
 	return names + " hasn't logged any verified time on this project, so the submission was auto-rejected. Everyone on a collaborative ship needs their own time on Hackatime, journals, or timelapses. If they did work on it, make sure their Hackatime account uses the email on the submission, then resubmit."
 }
@@ -96,6 +99,8 @@ func auditNote(in Input) string {
 		base = "Auto-rejected: stuck in processing for over 6 hours (evidence capture never completed)."
 	case in.Reason == DisallowedHackatimeProject:
 		base = "Changes requested: <<LAST_PROJECT>> was the only Hackatime project attached; it is not allowed for shipping in YSWS programs."
+	case in.Reason == HackatimeAccountNotFound:
+		base = "Changes requested: no verified time and no Hackatime account found by email or Slack id for - " + names + "."
 	default:
 		base = "Auto-rejected: collaborator(s) with zero verified time - " + names + "."
 	}
@@ -118,6 +123,8 @@ func activityText(in Input) string {
 		return "Auto-rejected: processing timed out"
 	case DisallowedHackatimeProject:
 		return "Changes requested: only Hackatime project was <<LAST_PROJECT>>"
+	case HackatimeAccountNotFound:
+		return "Changes requested: couldn't find a Hackatime account for " + strings.Join(in.Who, ", ")
 	}
 	return "Auto-rejected: no hours logged by " + strings.Join(in.Who, ", ")
 }

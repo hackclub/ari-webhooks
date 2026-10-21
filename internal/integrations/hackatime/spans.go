@@ -73,9 +73,10 @@ func (c *Client) authHeaders() map[string]string {
 	return map[string]string{"authorization": "Bearer " + c.AdminKey, "accept": "application/json"}
 }
 
-// ResolveUserId resolves the Hackatime user id by email. OK false means the
-// lookup failed; the caller must not treat that as "no Hackatime account".
-func (c *Client) ResolveUserId(ctx context.Context, email string) (ok bool, id string) {
+// ResolveUserId resolves the Hackatime user id by email, then by slack id when
+// no account has that email. OK false means lookup failed; the caller must
+// not treat that as "no Hackatime account".
+func (c *Client) ResolveUserId(ctx context.Context, email, slackId string) (ok bool, id string) {
 	if c.off() {
 		return true, "" // the deployment doesn't verify time: authoritative empty
 	}
@@ -83,20 +84,36 @@ func (c *Client) ResolveUserId(ctx context.Context, email string) (ok bool, id s
 	headers := c.authHeaders()
 	headers["content-type"] = "application/json"
 	res := httpx.JsonRetry(ctx, c.base()+"/api/admin/v1/user/get_user_by_email",
-		httpx.Opts{Method: "POST", Headers: headers, Body: string(body)}, 2)
-	if !res.OK {
+		httpx.Opts{Method: "POST", Headers: headers, Body: string(body), QuietStatuses: []int{404}}, 2)
+	if res.OK {
+		if id := userIdOf(res.Data); id != "" {
+			return true, id
+		}
+	} else if res.Status != 404 {
 		return false, ""
 	}
-	d := httpx.Obj(res.Data)
+	if slackId == "" {
+		return true, ""
+	}
+	res = httpx.JsonRetry(ctx, c.base()+"/api/v1/users/lookup_slack_uid/"+url.PathEscape(slackId),
+		httpx.Opts{Headers: c.authHeaders(), QuietStatuses: []int{404}}, 2)
+	if res.OK {
+		return true, userIdOf(res.Data)
+	}
+	return res.Status == 404, ""
+}
+
+func userIdOf(data any) string {
+	d := httpx.Obj(data)
 	user := httpx.Obj(d["user"])
 	for _, candidate := range []any{d["id"], d["user_id"], d["userId"], user["id"]} {
 		if candidate != nil {
 			if s := jsAnyString(candidate); s != "" {
-				return true, s
+				return s
 			}
 		}
 	}
-	return true, ""
+	return ""
 }
 
 // FetchTimeline fetches one UTC day of timeline (spans + commit markers).
