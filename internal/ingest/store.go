@@ -118,26 +118,63 @@ type shipStatusRow struct {
 	id, externalId, status string
 	version                int
 	claimed                bool
+	review                 *statusReviewRow
+}
+
+type statusReviewRow struct {
+	noteToMaker     string
+	auditNote       *string
+	reviewerEmail   *string
+	reviewerSlackId *string
+}
+
+func (r statusReviewRow) payload() map[string]any {
+	out := map[string]any{"note_to_maker": r.noteToMaker, "reviewer": nil}
+	if r.reviewerEmail != nil {
+		out["reviewer"] = map[string]any{"email": *r.reviewerEmail, "slack_id": r.reviewerSlackId}
+	}
+	if r.auditNote != nil {
+		out["audit_note"] = *r.auditNote
+	}
+	return out
 }
 
 // findShipForStatus resolves the status query's target: a specific ship by id,
 // or a project's latest ship by externalId (highest version; ingestedAt breaks
 // the tie for legacy rows sharing one). nil means no match, not an error.
 func (s *Service) findShipForStatus(ctx context.Context, programId, shipId, externalId string) (*shipStatusRow, error) {
-	where, arg := `id = $2`, shipId
+	where, arg := `s.id = $2`, shipId
 	if shipId == "" {
-		where, arg = `"externalId" = $2 order by version desc, "ingestedAt" desc`, externalId
+		where, arg = `s."externalId" = $2 order by s.version desc, s."ingestedAt" desc`, externalId
 	}
 	var row shipStatusRow
+	var noteToMaker, auditNote, reviewerEmail, reviewerSlackId *string
 	err := s.Pool.QueryRow(ctx, `
-		select id, "externalId", status::text, version, "claimedById" is not null
-		from "Submission" where "programId" = $1 and `+where+` limit 1`,
-		programId, arg).Scan(&row.id, &row.externalId, &row.status, &row.version, &row.claimed)
+		select s.id, s."externalId", s.status::text, s.version, s."claimedById" is not null,
+		       latest."noteToMaker", latest."auditNote", u.email, u."slackId"
+		from "Submission" s
+		left join lateral (
+			select "noteToMaker", "auditNote", "reviewerId"
+			from "Review" where "submissionId" = s.id
+			order by "createdAt" desc limit 1
+		) latest on true
+		left join "User" u on u.id = latest."reviewerId"
+		where s."programId" = $1 and `+where+` limit 1`,
+		programId, arg).Scan(&row.id, &row.externalId, &row.status, &row.version, &row.claimed,
+		&noteToMaker, &auditNote, &reviewerEmail, &reviewerSlackId)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if noteToMaker != nil {
+		row.review = &statusReviewRow{
+			noteToMaker:     *noteToMaker,
+			auditNote:       auditNote,
+			reviewerEmail:   reviewerEmail,
+			reviewerSlackId: reviewerSlackId,
+		}
 	}
 	return &row, nil
 }

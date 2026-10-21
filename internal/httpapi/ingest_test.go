@@ -743,6 +743,12 @@ func TestShipStatusPhases(t *testing.T) {
 		values ($1, 'rev@x.com', 'Rev', '#000000')`, reviewerId); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.pool.Exec(ctx, `
+		insert into "Review" (id, "submissionId", "reviewerId", decision, "noteToMaker", "auditNote", "fieldValues", checklist)
+		values ($1, $2, $3, 'approved', 'The firmware looks good', 'Hours check out', '{}', '[]')`,
+		ids.Cuid(), subId, reviewerId); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.pool.Exec(ctx,
 		`update "Submission" set "claimedById" = $1, "claimedAt" = now() where id = $2`, reviewerId, subId); err != nil {
 		t.Fatal(err)
@@ -766,6 +772,18 @@ func TestShipStatusPhases(t *testing.T) {
 	setStatus("approved")
 	expectPhase("external_id=ph-1", "reviewed", "approved")
 
+	_, body = f.getStatus(t, "external_id=ph-1", f.secret)
+	review, ok := body["review"].(map[string]any)
+	if !ok {
+		t.Fatalf("approved ship must carry the review: %v", body)
+	}
+	if review["note_to_maker"] != "The firmware looks good" || review["audit_note"] != "Hours check out" {
+		t.Fatalf("review wording: %v", review)
+	}
+	if reviewer, _ := review["reviewer"].(map[string]any); reviewer == nil || reviewer["email"] != "rev@x.com" {
+		t.Fatalf("review reviewer: %v", review["reviewer"])
+	}
+
 	setStatus("rejected")
 	expectPhase("external_id=ph-1", "reviewed", "rejected")
 
@@ -774,6 +792,11 @@ func TestShipStatusPhases(t *testing.T) {
 
 	setStatus("reverted")
 	expectPhase("external_id=ph-1", "reverted", nil)
+
+	_, body = f.getStatus(t, "external_id=ph-1", f.secret)
+	if _, present := body["review"]; present {
+		t.Fatalf("a ship without a decision must not carry a review: %v", body)
+	}
 
 	// A re-ship of the same project: external_id lookup must resolve to the
 	// latest version, while the old ship stays reachable by id. The body must

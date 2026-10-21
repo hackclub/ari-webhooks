@@ -218,13 +218,17 @@ func (s *Service) ProcessStatus(ctx context.Context, programId, authHeader, ship
 	if ship.status == "approved" || ship.status == "changes" || ship.status == "rejected" {
 		decision = ship.status
 	}
-	return Result{200, map[string]any{
+	body := map[string]any{
 		"id":          ship.id,
 		"external_id": ship.externalId,
 		"version":     ship.version,
 		"phase":       shipPhase(ship.status, ship.claimed),
 		"decision":    decision,
-	}}
+	}
+	if decision != nil && ship.review != nil {
+		body["review"] = ship.review.payload()
+	}
+	return Result{200, body}
 }
 
 // shipPhase maps a submission's DB state to the sender-facing review phase.
