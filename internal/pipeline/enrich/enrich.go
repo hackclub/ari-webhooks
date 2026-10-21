@@ -46,6 +46,7 @@ type Result struct {
 type person struct {
 	makerId         string
 	email           string
+	slackId         string
 	hackatimeUserId string
 	collaboratorRow string // SubmissionCollaborator.id; "" on solo ships
 }
@@ -191,7 +192,7 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 		for _, pers := range people {
 			uid := pers.hackatimeUserId
 			if uid == "" {
-				ok, resolved := p.Hackatime.ResolveUserId(ctx, pers.email)
+				ok, resolved := p.Hackatime.ResolveUserId(ctx, pers.email, pers.slackId)
 				if !ok {
 					htResolveFailed = true // degraded: someone's time may be missing
 				}
@@ -681,11 +682,27 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 		idle, err := p.collaboratorsWithoutHours(ctx, submissionId)
 		if err == nil && len(idle) > 0 {
 			notes = append(notes, fmt.Sprintf("collaborators_without_hours_%d", len(idle)))
-			p.Reject.AutoReject(ctx, autoreject.Input{
-				SubmissionId: submissionId,
-				Reason:       autoreject.CollaboratorNoHours,
-				Who:          idle,
-			})
+			var idleNames, unfound []string
+			for _, who := range idle {
+				idleNames = append(idleNames, who.name)
+				if _, tracked := htIdByMakerId[who.makerId]; htDeclared && !tracked {
+					unfound = append(unfound, who.name)
+				}
+			}
+			if len(unfound) == len(idle) {
+				p.Reject.RequestChanges(ctx, autoreject.Input{
+					SubmissionId:  submissionId,
+					Reason:        autoreject.HackatimeAccountNotFound,
+					Who:           unfound,
+					Collaborative: true,
+				})
+			} else {
+				p.Reject.AutoReject(ctx, autoreject.Input{
+					SubmissionId: submissionId,
+					Reason:       autoreject.CollaboratorNoHours,
+					Who:          idleNames,
+				})
+			}
 			settled = true
 		}
 	}
@@ -789,14 +806,14 @@ func (p *Pipeline) loadShip(ctx context.Context, submissionId string) (shipRow, 
 	err := p.Pool.QueryRow(ctx, `
 		select sub."programId", sub."externalId", sub."makerId", sub."repoUrl", sub."receivedAt",
 		       sub."hackatimeProjects", sub."programMeta", pr."trackingStartsAt",
-		       m.id, m.email, coalesce(m."hackatimeUserId", '')
+		       m.id, m.email, coalesce(m."slackId", ''), coalesce(m."hackatimeUserId", '')
 		from "Submission" sub
 		join "Program" pr on pr.id = sub."programId"
 		join "Maker" m on m.id = sub."makerId"
 		where sub.id = $1`,
 		submissionId).Scan(&s.programId, &s.externalId, &s.makerId, &s.repoUrl, &s.receivedAt,
 		&s.hackatimeProjects, &programMeta, &s.trackingStartsAt,
-		&s.maker.makerId, &s.maker.email, &s.maker.hackatimeUserId)
+		&s.maker.makerId, &s.maker.email, &s.maker.slackId, &s.maker.hackatimeUserId)
 	if err == pgx.ErrNoRows {
 		return shipRow{}, false, nil
 	}
@@ -809,7 +826,7 @@ func (p *Pipeline) loadShip(ctx context.Context, submissionId string) (shipRow, 
 	}
 
 	rows, err := p.Pool.Query(ctx, `
-		select c.id, m.id, m.email, coalesce(m."hackatimeUserId", '')
+		select c.id, m.id, m.email, coalesce(m."slackId", ''), coalesce(m."hackatimeUserId", '')
 		from "SubmissionCollaborator" c join "Maker" m on m.id = c."makerId"
 		where c."submissionId" = $1 order by c.id`,
 		submissionId)
@@ -819,7 +836,7 @@ func (p *Pipeline) loadShip(ctx context.Context, submissionId string) (shipRow, 
 	defer rows.Close()
 	for rows.Next() {
 		var pers person
-		if err := rows.Scan(&pers.collaboratorRow, &pers.makerId, &pers.email, &pers.hackatimeUserId); err != nil {
+		if err := rows.Scan(&pers.collaboratorRow, &pers.makerId, &pers.email, &pers.slackId, &pers.hackatimeUserId); err != nil {
 			return shipRow{}, false, err
 		}
 		s.collaborators = append(s.collaborators, pers)
@@ -844,9 +861,13 @@ func (p *Pipeline) priorApprovedShipMs(ctx context.Context, programId, externalI
 	return receivedAt.UnixMilli(), nil
 }
 
-func (p *Pipeline) collaboratorsWithoutHours(ctx context.Context, submissionId string) ([]string, error) {
+type idlePerson struct {
+	makerId, name string
+}
+
+func (p *Pipeline) collaboratorsWithoutHours(ctx context.Context, submissionId string) ([]idlePerson, error) {
 	rows, err := p.Pool.Query(ctx, `
-		select coalesce(nullif(m.name, ''), m.email)
+		select m.id, coalesce(nullif(m.name, ''), m.email)
 		from "SubmissionCollaborator" c join "Maker" m on m.id = c."makerId"
 		where c."submissionId" = $1
 		  and c."hackatimeSeconds" + c."devlogSeconds" + c."lapseSeconds" + c."programSeconds" = 0
@@ -857,10 +878,10 @@ func (p *Pipeline) collaboratorsWithoutHours(ctx context.Context, submissionId s
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	var out []idlePerson
 	for rows.Next() {
-		var who string
-		if err := rows.Scan(&who); err != nil {
+		var who idlePerson
+		if err := rows.Scan(&who.makerId, &who.name); err != nil {
 			return nil, err
 		}
 		out = append(out, who)
