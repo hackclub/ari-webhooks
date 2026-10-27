@@ -16,9 +16,10 @@ func ReapStuckSubmissions(ctx context.Context, pool *pgxpool.Pool, reject *autor
 	// Age from ingestedAt (wall-clock row creation), NOT receivedAt: receivedAt is
 	// backdatable via shipped_at, which would make every migration ship "stuck".
 	rows, err := pool.Query(ctx, `
-		select id, extract(epoch from now() - "ingestedAt") / 3600
-		from "Submission"
-		where status = 'processing' and "ingestedAt" < now() - interval '6 hours'`)
+		select s.id, extract(epoch from now() - s."ingestedAt") / 3600
+		from "Submission" s join "Program" p on p.id = s."programId"
+		where s.status = 'processing' and s."ingestedAt" < now() - interval '6 hours'
+		  and p.status != 'ARCHIVED'`) // an archived program is paused: its held captures resume on restore instead of being rejected as stuck
 	if err != nil {
 		return err
 	}

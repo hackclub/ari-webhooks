@@ -334,6 +334,39 @@ func TestUnavailableEndpointHoldsThenFails(t *testing.T) {
 	}
 }
 
+func TestArchivedProgramHoldsDeliveriesUntilRestored(t *testing.T) {
+	var hits atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+	f := setupOutbox(t, receiver.URL)
+	ctx := context.Background()
+	if _, err := f.pool.Exec(ctx, `update "Program" set status = 'ARCHIVED' where id = $1`, f.programId); err != nil {
+		t.Fatal(err)
+	}
+
+	id := f.insertDelivery(t, `{"x":1}`, 6)
+	if _, err := f.worker.claimDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.worker.processDelivery(ctx, id)
+	status, attempts, _ := f.deliveryState(t, id)
+	if hits.Load() != 0 || status != "PENDING" || attempts != 0 {
+		t.Fatalf("archived program must send nothing and hold the delivery: hits=%d %s attempts=%d", hits.Load(), status, attempts)
+	}
+
+	if _, err := f.pool.Exec(ctx, `update "Program" set status = 'ACTIVE' where id = $1`, f.programId); err != nil {
+		t.Fatal(err)
+	}
+	f.worker.processDelivery(ctx, id)
+	status, _, _ = f.deliveryState(t, id)
+	if hits.Load() != 1 || status != "DELIVERED" {
+		t.Fatalf("restored program must deliver the held row: hits=%d %s", hits.Load(), status)
+	}
+}
+
 func TestPrivateDestinationHoldsWhenGuardIsOn(t *testing.T) {
 	f := setupOutbox(t, "http://10.0.0.8/hook")
 	f.worker.AllowPrivateDestinations = false // exercise the real production guard
