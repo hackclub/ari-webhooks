@@ -106,16 +106,19 @@ func (w *Worker) processDelivery(ctx context.Context, deliveryId string) {
 		endpointEnabled   *bool
 		endpointUrl       *string
 		endpointSecretEnc *string
+		programArchived   bool
 	)
 	err := w.Pool.QueryRow(ctx, `
 		select d."programId", d.event, d."submissionId", d.payload, d.attempts, d."httpStatus",
 		       extract(epoch from now() - d."createdAt"),
-		       e.enabled, e.url, e."secretEnc"
+		       e.enabled, e.url, e."secretEnc",
+		       coalesce(p.status = 'ARCHIVED', false)
 		from "OutboundDelivery" d
 		left join "OutboundEndpoint" e on e."programId" = d."programId"
+		left join "Program" p on p.id = d."programId"
 		where d.id = $1 and d.status = 'PENDING'`,
 		deliveryId).Scan(&programId, &event, &submissionId, &payload, &attempts, &lastStatus,
-		&ageSeconds, &endpointEnabled, &endpointUrl, &endpointSecretEnc)
+		&ageSeconds, &endpointEnabled, &endpointUrl, &endpointSecretEnc, &programArchived)
 	if err != nil {
 		if ctx.Err() == nil && err != pgx.ErrNoRows {
 			slog.Warn("outbound load failed", "deliveryId", deliveryId, "err", err)
@@ -125,6 +128,10 @@ func (w *Worker) processDelivery(ctx context.Context, deliveryId string) {
 
 	if payload == nil {
 		w.markFailed(ctx, deliveryId, lastStatus, "cannot resume (no stored payload)", attempts)
+		return
+	}
+	if programArchived { // an archived program sends nothing; restoring it within the hold window lets the delivery go out
+		w.holdOrFail(ctx, deliveryId, lastStatus, "program archived", attempts, ageSeconds)
 		return
 	}
 	if endpointEnabled == nil || !*endpointEnabled || endpointUrl == nil || *endpointUrl == "" ||

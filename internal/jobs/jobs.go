@@ -10,6 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/hackclub/ari-webhooks/internal/db"
 )
 
 type Job struct {
@@ -209,6 +211,13 @@ func (q *Queue) runOne(ctx context.Context, j Job) {
 				}
 			}
 		}()
+		archived, err := db.SubmissionArchived(ctx, q.pool, j.SubmissionId)
+		if err != nil {
+			return RetryAt(time.Now().Add(time.Minute), j.Attempt, j.TimeoutRetries, "program status lookup failed: "+err.Error()) // one minute, and no attempt spent: the lookup failed, not the job
+		}
+		if archived { // an archived program is paused: its ships get no scans, checks or deliveries, and restoring it picks the job back up
+			return RetryAt(time.Now().Add(10*time.Minute), j.Attempt, j.TimeoutRetries, "program archived") // re-checked every 10 minutes with no attempt spent, so a long archive never kills the job
+		}
 		h, ok := q.handlers[j.Kind]
 		if !ok {
 			return Dead("no handler registered for kind " + j.Kind)

@@ -153,6 +153,30 @@ func TestReapStuckSubmissions(t *testing.T) {
 	}
 }
 
+func TestReapStuckSubmissionsSkipsArchivedPrograms(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	programId, _ := seedProgramAndUser(t, pool)
+	codec, _ := cryptobox.New(make([]byte, 32))
+	reject := &autoreject.Service{Pool: pool, Outbound: outbound.NewWorker(pool, codec, "test")}
+	wedged := seedShip(t, pool, programId, "processing", "7 hours")
+	if _, err := pool.Exec(ctx, `update "Program" set status = 'ARCHIVED' where id = $1`, programId); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ReapStuckSubmissions(ctx, pool, reject); err != nil {
+		t.Fatal(err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `select status::text from "Submission" where id = $1`, wedged).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "processing" {
+		t.Fatalf("an archived program's ship must be left alone, got %s", status)
+	}
+}
+
 func TestVmReaper(t *testing.T) {
 	pool := testdb.New(t)
 	ctx := context.Background()

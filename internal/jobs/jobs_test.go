@@ -65,6 +65,66 @@ func TestClaimRespectsRunAtAndSettles(t *testing.T) {
 	}
 }
 
+func TestArchivedProgramHoldsItsJobsUntilRestored(t *testing.T) {
+	pool := testdb.New(t)
+	q := NewQueue(pool, "test")
+	ctx := context.Background()
+	for _, seed := range []string{
+		`insert into "Program" (id, name, color, status) values ('program1', 'P', '#000', 'ARCHIVED')`,
+		`insert into "Maker" (id, email) values ('maker1', 'user1@example.com')`,
+		`insert into "Submission" (id, "programId", "externalId", "makerId", title, "repoUrl", "claimedHours")
+		 values ('ship1', 'program1', 'project1', 'maker1', 'T', 'https://github.com/a/b', 0)`,
+	} {
+		if _, err := pool.Exec(ctx, seed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ran atomic.Int32
+	q.Register("screen", func(ctx context.Context, j Job) Outcome {
+		ran.Add(1)
+		return Done()
+	})
+	if err := q.Enqueue(ctx, "screen", "ship1", time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := q.claim(ctx, 10)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	q.runOne(ctx, claimed[0])
+	var status, lastError string
+	var attempt int
+	var deferred bool
+	if err := pool.QueryRow(ctx, `
+		select status, attempt, coalesce("lastError", ''), "runAt" > now() + interval '5 minutes'
+		from ariw.job where "submissionId" = 'ship1'`).Scan(&status, &attempt, &lastError, &deferred); err != nil {
+		t.Fatal(err)
+	}
+	if ran.Load() != 0 || status != "due" || attempt != 0 || lastError != "program archived" || !deferred {
+		t.Fatalf("archived program must hold the job without running it: ran=%d status=%s attempt=%d lastError=%q deferred=%v",
+			ran.Load(), status, attempt, lastError, deferred)
+	}
+
+	if _, err := pool.Exec(ctx, `update "Program" set status = 'ACTIVE' where id = 'program1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `update ariw.job set "runAt" = now() where "submissionId" = 'ship1'`); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = q.claim(ctx, 10)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim after restore: %v %v", claimed, err)
+	}
+	q.runOne(ctx, claimed[0])
+	if err := pool.QueryRow(ctx, `select status from ariw.job where "submissionId" = 'ship1'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if ran.Load() != 1 || status != "done" {
+		t.Fatalf("restored program must run the held job: ran=%d status=%s", ran.Load(), status)
+	}
+}
+
 func TestRunExecutesAndSurvivesPanic(t *testing.T) {
 	pool := testdb.New(t)
 	q := NewQueue(pool, "test")

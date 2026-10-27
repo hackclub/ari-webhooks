@@ -33,6 +33,10 @@ func databaseError(c fiber.Ctx, what string, err error) error {
 	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "Database error"})
 }
 
+func ArchivedProgram(c fiber.Ctx) error {
+	return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": "This program is archived. Restore it first."})
+}
+
 // internalReenrich queues a fresh evidence capture for a ship already in the
 // review queue (the review screen's resync button). Async by design: a capture
 // can take minutes, so ari polls the submission's
@@ -40,12 +44,19 @@ func databaseError(c fiber.Ctx, what string, err error) error {
 func (s *Server) internalReenrich(c fiber.Ctx) error {
 	submissionId := c.Params("submission")
 	var status string
-	err := s.Pool.QueryRow(c.Context(), `select status::text from "Submission" where id = $1`, submissionId).Scan(&status)
+	var archived bool
+	err := s.Pool.QueryRow(c.Context(), `
+		select s.status::text, p.status = 'ARCHIVED'
+		from "Submission" s join "Program" p on p.id = s."programId"
+		where s.id = $1`, submissionId).Scan(&status, &archived)
 	if err == pgx.ErrNoRows {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "Submission not found"})
 	}
 	if err != nil {
 		return databaseError(c, "reenrich status lookup failed", err)
+	}
+	if archived { // an archived program is paused: nothing is captured for its ships until it is restored
+		return ArchivedProgram(c)
 	}
 	// Matches the reenrich handler's own gate; rejecting here gives ari a
 	// message it can show instead of a job that silently settles as a no-op.
@@ -66,13 +77,17 @@ func (s *Server) internalReenrich(c fiber.Ctx) error {
 // by that job rather than getting a duplicate.
 func (s *Server) internalReenrichProgram(c fiber.Ctx) error {
 	programId := c.Params("program")
-	var exists bool
-	if err := s.Pool.QueryRow(c.Context(),
-		`select exists (select 1 from "Program" where id = $1)`, programId).Scan(&exists); err != nil {
+	var archived bool
+	err := s.Pool.QueryRow(c.Context(),
+		`select status = 'ARCHIVED' from "Program" where id = $1`, programId).Scan(&archived)
+	if err == pgx.ErrNoRows {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "Program not found"})
+	}
+	if err != nil {
 		return databaseError(c, "reenrich program lookup failed", err)
 	}
-	if !exists {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "Program not found"})
+	if archived { // an archived program is paused: nothing is captured for its ships until it is restored
+		return ArchivedProgram(c)
 	}
 	rows, err := s.Pool.Query(c.Context(),
 		`select id from "Submission" where "programId" = $1 and status = 'pending'`, programId)

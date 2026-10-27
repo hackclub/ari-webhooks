@@ -57,8 +57,10 @@ func (s *Service) targetEvidenceVersion() int {
 func (s *Service) Sweep(ctx context.Context) error {
 	rows, err := s.Pool.Query(ctx, `
 		select s.id from "Submission" s
+		join "Program" p on p.id = s."programId"
 		left join ariw."submissionEvidenceVersion" ev on ev."submissionId" = s.id
 		where coalesce(ev.version, 1) < $1 and s.status != 'processing'
+		  and p.status != 'ARCHIVED'
 		  and not exists (
 		    select 1 from "Submission" earlier
 		    left join ariw."submissionEvidenceVersion" earlier_ev
@@ -321,12 +323,13 @@ func (s *Service) finish(ctx context.Context, submissionId string, expectedEvide
 
 func (s *Service) retryDecisionNotifications(ctx context.Context) error {
 	rows, err := s.Pool.Query(ctx, `
-		select id, "programId", "submissionId", meta->>'outboundEvent',
-		       meta->>'fromStatus', meta->>'toStatus'
-		from "ActivityEvent"
-		where meta->>'op' = 'evidence_algorithm_updated'
-		  and coalesce((meta->>'outboundComplete')::boolean, true) = false
-		order by "createdAt" limit 100`)
+		select ae.id, ae."programId", ae."submissionId", ae.meta->>'outboundEvent',
+		       ae.meta->>'fromStatus', ae.meta->>'toStatus'
+		from "ActivityEvent" ae join "Program" p on p.id = ae."programId"
+		where ae.meta->>'op' = 'evidence_algorithm_updated'
+		  and coalesce((ae.meta->>'outboundComplete')::boolean, true) = false
+		  and p.status != 'ARCHIVED'
+		order by ae."createdAt" limit 100`) // an archived program is paused: the notice stays owed and goes out once it is restored
 	if err != nil {
 		return err
 	}

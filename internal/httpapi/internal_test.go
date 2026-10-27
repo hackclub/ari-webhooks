@@ -153,6 +153,28 @@ func TestInternalReenrichRefusesShipsNotInTheQueue(t *testing.T) {
 	}
 }
 
+func TestInternalReenrichRefusesArchivedPrograms(t *testing.T) {
+	pool, app, subId := shipFixture(t, nil)
+	var programId string
+	if err := pool.QueryRow(context.Background(), `
+		update "Program" set status = 'ARCHIVED'
+		where id = (select "programId" from "Submission" where id = $1)
+		returning id`, subId).Scan(&programId); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := callInternal(t, app, "POST", "/internal/reenrich/"+subId, "sekrit", "")
+	if code != 409 || body["message"] != "This program is archived. Restore it first." {
+		t.Fatalf("archived ship: got %d %v", code, body)
+	}
+	if code, _ := callInternal(t, app, "POST", "/internal/reenrich-program/"+programId, "sekrit", ""); code != 409 {
+		t.Fatalf("archived program: got %d, want 409", code)
+	}
+	if n := liveReenrichJobs(t, pool, subId); n != 0 {
+		t.Fatalf("an archived program must get no captures: %d", n)
+	}
+}
+
 func TestInternalRejectsWrongOrMissingTokenOnEveryRoute(t *testing.T) {
 	_, app, subId := shipFixture(t, nil)
 	for _, path := range []string{"/internal/reenrich/" + subId, "/internal/anything/" + subId} {

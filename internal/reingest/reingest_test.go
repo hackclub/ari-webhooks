@@ -112,6 +112,24 @@ func TestSweepQueuesEveryStaleSettledShip(t *testing.T) {
 	}
 }
 
+func TestSweepSkipsArchivedPrograms(t *testing.T) {
+	f := setup(t)
+	f.seedShip(t, "stale-pending", "pending", 1)
+	if _, err := f.pool.Exec(context.Background(),
+		`update "Program" set status = 'ARCHIVED' where id = $1`, f.programId); err != nil {
+		t.Fatal(err)
+	}
+	queue := &fakeQueue{}
+	service := &Service{Pool: f.pool, Queue: queue, TargetEvidenceVersion: 2}
+
+	if err := service.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(queue.jobs) != 0 {
+		t.Fatalf("an archived program must not be reprocessed: %+v", queue.jobs)
+	}
+}
+
 func TestSweepQueuesProjectRevisionsOldestFirst(t *testing.T) {
 	f := setup(t)
 	f.seedShip(t, "old", "approved", 1)
