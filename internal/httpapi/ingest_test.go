@@ -605,6 +605,33 @@ func TestIngestBackdatedShippedAt(t *testing.T) {
 	}
 }
 
+func TestReshipAfterChangesWaitsFromItsOwnShip(t *testing.T) {
+	f := setup(t, false)
+	ctx := context.Background()
+
+	first := strings.Replace(validShip("reship-1"), `"meta"`, `"shipped_at": "2026-01-15T12:00:00Z", "meta"`, 1)
+	status, body := f.post(t, "/api/ingest/"+f.programId, first, sign(f.secret, first))
+	if status != 202 {
+		t.Fatalf("first ship: %d %v", status, body)
+	}
+	if _, err := f.pool.Exec(ctx, `update "Submission" set status = 'changes' where id = $1`, body["id"]); err != nil {
+		t.Fatal(err)
+	}
+
+	again := validShip("reship-1")
+	status, body = f.post(t, "/api/ingest/"+f.programId, again, sign(f.secret, again))
+	if status != 202 {
+		t.Fatalf("re-ship: %d %v", status, body)
+	}
+	var receivedAt, queuedAt time.Time
+	if err := f.pool.QueryRow(ctx, `select "receivedAt", "queuedAt" from "Submission" where id = $1`, body["id"]).Scan(&receivedAt, &queuedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !queuedAt.Equal(receivedAt) {
+		t.Fatalf("re-ship must wait from its own ship: queuedAt %v, receivedAt %v", queuedAt, receivedAt)
+	}
+}
+
 func TestIngestConcurrentSameProject(t *testing.T) {
 	f := setup(t, false)
 

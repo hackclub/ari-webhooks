@@ -193,22 +193,6 @@ func (s *Service) createShip(ctx context.Context, programId string, ship ShipPay
 			return err
 		}
 
-		var inheritedQueuedAt *time.Time
-		if prior > 0 {
-			var prevStatus string
-			var prevQueuedAt time.Time
-			if err := tx.QueryRow(ctx, `
-				select status::text, "queuedAt" from "Submission"
-				where "programId" = $1 and "externalId" = $2
-				order by version desc, "ingestedAt" desc limit 1`,
-				programId, ship.ExternalId).Scan(&prevStatus, &prevQueuedAt); err != nil {
-				return err
-			}
-			if prevStatus == "changes" { // a re-ship fixing requested changes keeps the project's place in the review queue; any other prior outcome resets it
-				inheritedQueuedAt = &prevQueuedAt
-			}
-		}
-
 		upsertPerson := func(p ShipPerson) (string, error) {
 			var makerId string
 			// Create with nulls for absent fields; update only overwrites with present
@@ -264,7 +248,7 @@ func (s *Service) createShip(ctx context.Context, programId string, ship ShipPay
 
 		// receivedAt / queuedAt: only written when overridden so an absent override
 		// keeps the exact DB-default semantics Prisma relies on (both default to
-		// the same transaction-time now(), so they stay equal for a fresh ship).
+		// the same transaction-time now(), so they stay equal).
 		extraCols, extraVals := "", ""
 		args := []any{submissionId, programId, ship.ExternalId, prior + 1, makerId, ship.Title, ship.Description,
 			ship.RepoUrl, ship.DemoUrl, ship.ThumbnailUrl, jsonOrNil(ship.Meta), ship.IsUpdate, ship.UpdateMessage,
@@ -276,11 +260,6 @@ func (s *Service) createShip(ctx context.Context, programId string, ship ShipPay
 		}
 		if shippedAt != nil {
 			addCol("receivedAt", shippedAt.UTC())
-		}
-		switch {
-		case inheritedQueuedAt != nil:
-			addCol("queuedAt", inheritedQueuedAt.UTC())
-		case shippedAt != nil:
 			addCol("queuedAt", shippedAt.UTC())
 		}
 		_, err = tx.Exec(ctx, `
