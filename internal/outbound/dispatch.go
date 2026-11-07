@@ -40,6 +40,8 @@ type FraudCheckResult struct {
 	SlackId       *string `json:"slack_id"`
 	TrustScore    *int    `json:"trust_score"`
 	Justification *string `json:"justification"`
+	// absent on a review recorded before the fraud team gave deflated hours
+	DeflateSeconds *int `json:"deflate_seconds,omitempty"`
 }
 
 type FraudBlock struct {

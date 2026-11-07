@@ -73,3 +73,10 @@ func Parts(weights []float64) (int, []int) {
 	total := Round(sum)
 	return total, SplitFloat(total, weights)
 }
+
+func FromHours(hours float64) int {
+	if math.IsNaN(hours) || math.IsInf(hours, 0) || hours <= 0 {
+		return 0
+	}
+	return Round(hours * 3600) // 3600: seconds in an hour
+}

@@ -1,6 +1,7 @@
 package secs
 
 import (
+	"math"
 	"reflect"
 	"testing"
 )
@@ -56,5 +57,17 @@ func TestPartsSumToTheRoundedTotal(t *testing.T) {
 	huge := SplitProportional(2_000_000_000, []int{9_000_000_000_000, 1})
 	if huge[0]+huge[1] != 2_000_000_000 {
 		t.Fatalf("large split lost units: %v", huge)
+	}
+}
+
+func TestFromHours(t *testing.T) {
+	cases := map[float64]int{1.5: 5400, 0: 0, -2: 0, 0.0001: 0, 0.00014: 1, 2.25: 8100}
+	for hours, want := range cases {
+		if got := FromHours(hours); got != want {
+			t.Fatalf("FromHours(%v) = %d, want %d", hours, got, want)
+		}
+	}
+	if FromHours(math.NaN()) != 0 || FromHours(math.Inf(1)) != 0 {
+		t.Fatal("non-finite hours must be no time")
 	}
 }
