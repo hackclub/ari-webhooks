@@ -271,7 +271,7 @@ func TestFetchProjectSpansWindowCreditsCaseVariants(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseUrl: srv.URL, AdminKey: "test"}
-	res := c.FetchProjectSpansWindow(context.Background(), "u1", []string{"game"}, 0, 5000)
+	res := c.FetchProjectSpansWindow(context.Background(), "u1", []string{"game"}, 0, 5000, nil)
 	if !res.OK || res.Source != "heartbeats" {
 		t.Fatalf("result: %+v", res)
 	}
@@ -295,7 +295,7 @@ func TestFetchProjectSpansWindowTreatsDeniedOracleAsAuthoritative(t *testing.T) 
 	defer srv.Close()
 
 	c := &Client{BaseUrl: srv.URL, AdminKey: "test"}
-	res := c.FetchProjectSpansWindow(context.Background(), "u1", []string{"app"}, 0, 5000)
+	res := c.FetchProjectSpansWindow(context.Background(), "u1", []string{"app"}, 0, 5000, nil)
 	if !res.OK || res.Source != "heartbeats" || len(res.Spans) != 0 {
 		t.Fatalf("a 403 oracle must not wedge an authoritative zero from the admin walk: %+v", res)
 	}
@@ -312,5 +312,65 @@ func TestEntitySecondsDiscountsAiGaps(t *testing.T) {
 	})
 	if !closeTo(got["a.go"], 80*(1.0/3)+80) {
 		t.Fatalf("a.go = %v, want the ai gap at one third plus the full coding gap", got["a.go"])
+	}
+}
+
+func lapseBeatJson(time float64, project, clipName, clipId string) map[string]any {
+	return map[string]any{"time": time, "project": project, "entity": clipName + " (" + clipId + ")", "type": "timelapse", "category": "timelapsing"}
+}
+
+// Lapse syncs a published clip's snapshots into Hackatime, and the clip is paid on
+// its own lapse row. A clip the ship credits must not be paid a second time through
+// its synced beats; a clip the ship does not credit keeps its Hackatime time.
+func TestFetchProjectSpansWindowLeavesOutCreditedLapseBeats(t *testing.T) {
+	var page []map[string]any
+	page = append(page, beatJson(1000, "game"), beatJson(1060, "game"))
+	for at := 2000.0; at <= 2600; at += 60 {
+		page = append(page, lapseBeatJson(at, "game", "clip one", "clip1"))
+	}
+	page = append(page, lapseBeatJson(4000, "game", "clip two", "clip2"), lapseBeatJson(4060, "game", "clip two", "clip2"))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/admin/v1/user/heartbeats", func(w http.ResponseWriter, r *http.Request) {
+		writeHeartbeatPage(w, page, false)
+	})
+	mux.HandleFunc("/api/v1/users/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.Write([]byte(`{"projects":[{"name":"game","total_seconds":960}]}`)) // 60 + (600+120) + (60+120): what Hackatime reports
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &Client{BaseUrl: srv.URL, AdminKey: "test"}
+	res := c.FetchProjectSpansWindow(context.Background(), "u1", []string{"game"}, 0, 5000, map[string]bool{"clip1": true})
+	if !res.OK || res.Source != "heartbeats" {
+		t.Fatalf("the oracle still counts the synced beats, so the capture must stay trusted: %+v", res)
+	}
+	if got := totalOf(res.Spans); got != 240 {
+		t.Fatalf("credited = %v, want 240: 60s of coding plus the 180s of the clip the ship does not credit", got)
+	}
+	if res.LapseExcludedSeconds != 720 {
+		t.Fatalf("LapseExcludedSeconds = %v, want the 720s the credited clip added to Hackatime", res.LapseExcludedSeconds)
+	}
+
+	all := c.FetchProjectSpansWindow(context.Background(), "u1", []string{"game"}, 0, 5000, nil)
+	if totalOf(all.Spans) != 960 || all.LapseExcludedSeconds != 0 {
+		t.Fatalf("with no credited clips every beat counts: %+v", all)
+	}
+}
+
+func TestLapseClipIdOfOnlyMatchesTimelapseBeats(t *testing.T) {
+	cases := []struct {
+		beat Heartbeat
+		want string
+	}{
+		{Heartbeat{Entity: "clip one (clip1)", Kind: "timelapse", Category: "timelapsing"}, "clip1"},
+		{Heartbeat{Entity: "clip one (clip1)", Category: "timelapsing"}, "clip1"},
+		{Heartbeat{Entity: "/home/user1/project12/notes (draft).md", Kind: "file", Category: "coding"}, ""},
+		{Heartbeat{Entity: "clip without id", Kind: "timelapse"}, ""},
+	}
+	for _, tc := range cases {
+		if got := lapseClipIdOf(tc.beat); got != tc.want {
+			t.Fatalf("lapseClipIdOf(%+v) = %q, want %q", tc.beat, got, tc.want)
+		}
 	}
 }

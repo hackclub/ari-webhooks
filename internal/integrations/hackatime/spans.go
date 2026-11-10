@@ -211,6 +211,20 @@ func isAiCoding(category string) bool {
 	return c == "ai coding"
 }
 
+// lapseClipIdOf returns the Lapse clip a heartbeat was synced from, or "". Lapse
+// names the entity "<clip name> (<clip id>)" and marks the beat as a timelapse.
+func lapseClipIdOf(b Heartbeat) string {
+	if !strings.EqualFold(strings.TrimSpace(b.Kind), "timelapse") && !strings.EqualFold(strings.TrimSpace(b.Category), "timelapsing") {
+		return ""
+	}
+	entity := strings.TrimSpace(b.Entity)
+	open := strings.LastIndex(entity, "(")
+	if open < 0 || !strings.HasSuffix(entity, ")") {
+		return ""
+	}
+	return strings.TrimSpace(entity[open+1 : len(entity)-1])
+}
+
 // SpansFromHeartbeats reshapes Hackatime's exact counting rule into per-project
 // spans: sessions break on gaps > 120s; each session after the first carries
 // the capped 120s re-entry gap. Sum of durations == Hackatime's official total.
@@ -349,6 +363,15 @@ type ProjectSpansResult struct {
 	// from Spans. Always 0 on non-heartbeat sources: the spans API carries no
 	// categories, so recovered captures cannot be discounted.
 	AiDiscountedSeconds float64
+	// LapseExcludedSeconds is the Hackatime time that came from heartbeats Lapse
+	// synced for a clip the ship already credits. Always 0 on non-heartbeat sources:
+	// the spans API carries no entities, so those captures fall back on the clip
+	// window subtraction alone.
+	LapseExcludedSeconds float64
+	// LapseRecordingSpans holds, per credited clip id, when its synced beats say the
+	// recording really ran, so editor time is deduped against that rather than
+	// against the clip's createdAt window.
+	LapseRecordingSpans map[string][]Span
 }
 
 // EntitySeconds mirrors Hackatime's counting so file totals sum to the same
@@ -398,8 +421,10 @@ func totalOf(spans []Span) float64 {
 // FetchProjectSpansWindow ports ari's hardened capture: heartbeats walk as the
 // primary source, cross-checked against the projects/details oracle, recovered
 // through the public spans endpoint when they disagree. OK false keeps the
-// retry window open instead of persisting a possible false zero.
-func (c *Client) FetchProjectSpansWindow(ctx context.Context, userId string, projects []string, startTs, endTs float64) ProjectSpansResult {
+// retry window open instead of persisting a possible false zero. creditedClipIds
+// names the Lapse clips the ship already credits; their synced heartbeats are left
+// out of the returned spans so the same recording is not paid twice.
+func (c *Client) FetchProjectSpansWindow(ctx context.Context, userId string, projects []string, startTs, endTs float64, creditedClipIds map[string]bool) ProjectSpansResult {
 	if c.off() {
 		return ProjectSpansResult{OK: true, Source: "none"}
 	}
@@ -458,6 +483,34 @@ func (c *Client) FetchProjectSpansWindow(ctx context.Context, userId string, pro
 	// and trigger the spans-api recovery, which cannot see categories and would
 	// silently undo it.
 	derivedS := totalOf(derived)
+	// Lapse pushes each published clip's snapshots into Hackatime as heartbeats, and
+	// the clip is credited on its own lapse row. Those beats come out after the oracle
+	// check for the same reason as the AI discount: the oracle counts them.
+	lapseExcluded := 0.0
+	var recordingSpans map[string][]Span
+	if hbOk && len(creditedClipIds) > 0 {
+		var kept []Heartbeat
+		removedByClip := map[string][]Heartbeat{}
+		for _, b := range beats {
+			if !declared(b.Project) {
+				continue
+			}
+			if clipId := lapseClipIdOf(b); clipId != "" && creditedClipIds[clipId] {
+				removedByClip[clipId] = append(removedByClip[clipId], b)
+				continue
+			}
+			kept = append(kept, b)
+		}
+		if len(removedByClip) > 0 {
+			derived = SpansFromHeartbeats(kept)
+			lapseExcluded = derivedS - totalOf(derived)
+			entitySeconds = EntitySeconds(kept)
+			recordingSpans = map[string][]Span{}
+			for clipId, removed := range removedByClip {
+				recordingSpans[clipId] = SpansFromHeartbeats(removed)
+			}
+		}
+	}
 	aiRemoved := 0.0
 	derived, aiRemoved = DiscountAiCoding(derived)
 
@@ -515,13 +568,13 @@ func (c *Client) FetchProjectSpansWindow(ctx context.Context, userId string, pro
 		// spans recovery alike; retrying can never verify anything. The admin
 		// heartbeats walk already succeeded, so its answer is authoritative even
 		// at zero, and persisting it beats wedging the capture open forever.
-		return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved},
+		return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved, LapseExcludedSeconds: lapseExcluded, LapseRecordingSpans: recordingSpans},
 			"hackatime_oracle_denied")
 	}
 
 	if !oracleOk {
 		if derivedS > 0 {
-			return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved})
+			return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved, LapseExcludedSeconds: lapseExcluded, LapseRecordingSpans: recordingSpans})
 		}
 		if recOk, recSpans := recover(); recOk {
 			if totalOf(recSpans) > 0 {
@@ -534,7 +587,7 @@ func (c *Client) FetchProjectSpansWindow(ctx context.Context, userId string, pro
 
 	tolerance := math.Max(1800, oracleS*0.25) // disagreement allowance before a capture is distrusted
 	if derivedS >= oracleS-tolerance {
-		return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved})
+		return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved, LapseExcludedSeconds: lapseExcluded, LapseRecordingSpans: recordingSpans})
 	}
 
 	if recOk, recSpans := recover(); recOk && totalOf(recSpans) > derivedS {
@@ -545,7 +598,7 @@ func (c *Client) FetchProjectSpansWindow(ctx context.Context, userId string, pro
 		// The oracle says there IS time but neither source produced it.
 		return withNotes(ProjectSpansResult{Source: "none"}, "hackatime_zero_contradicts_oracle")
 	}
-	return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved},
+	return withNotes(ProjectSpansResult{OK: true, Spans: derived, Source: "heartbeats", EntitySeconds: entitySeconds, AiDiscountedSeconds: aiRemoved, LapseExcludedSeconds: lapseExcluded, LapseRecordingSpans: recordingSpans},
 		fmt.Sprintf("hackatime_short_vs_oracle_%dm_vs_%dm", jsRoundMinutes(derivedS), jsRoundMinutes(oracleS)))
 }
 

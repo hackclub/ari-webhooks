@@ -234,12 +234,64 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 		}
 	}
 
+	// Lapse clips per person x declared project, fetched BEFORE Hackatime so the
+	// heartbeats Lapse synced for a credited clip are left out of that person's
+	// spans, and each clip's wall-clock interval is subtracted out of what remains.
+	// Lapse serves a project's whole recording history with no window of its own,
+	// so the tracking window has to gate the clips here: [trackFrom, submission),
+	// the same half-open shape the heartbeat walk uses. Without it an update ship
+	// re-credits every clip a prior approval already paid for.
+	type ownedClip struct {
+		clip    lapse.Clip
+		makerId string
+		project string
+	}
+	var clips []ownedClip
+	clipsOutOfWindow := 0
+	lapseAttempted := len(htIdByMakerId) > 0 && len(projects) > 0
+	lapseOk := true
+	if lapseAttempted {
+		for _, pers := range people {
+			uid, tracked := htIdByMakerId[pers.makerId]
+			if !tracked {
+				continue
+			}
+			for _, key := range projects {
+				r := p.Lapse.FetchClips(ctx, uid, key)
+				if !r.OK {
+					lapseOk = false
+				}
+				for _, clip := range r.Clips {
+					at := clip.CreatedAt.UnixMilli()
+					if at < trackFromMs || at >= trackUntilMs {
+						clipsOutOfWindow++
+						continue
+					}
+					clips = append(clips, ownedClip{clip: clip, makerId: pers.makerId, project: key})
+				}
+			}
+		}
+	}
+	// only a capture whose clips will be written may take their beats out of Hackatime,
+	// or a partly failed Lapse fetch would drop the recording from both rows
+	creditedClipIdsByMaker := map[string]map[string]bool{}
+	for _, oc := range clips {
+		if oc.clip.ExternalId == "" || !lapseOk || htResolveFailed {
+			continue
+		}
+		if creditedClipIdsByMaker[oc.makerId] == nil {
+			creditedClipIdsByMaker[oc.makerId] = map[string]bool{}
+		}
+		creditedClipIdsByMaker[oc.makerId][oc.clip.ExternalId] = true
+	}
+
 	// Heartbeats over the full tracking window [trackFrom, submission]. Anchoring
 	// the window to the first commit would drop time logged before it, and makers
 	// often code for weeks before their first push. Worth fetching even with zero
 	// commits when projects are declared (hardware ships with a CAD repo_url
 	// still have real Hackatime time).
 	spansByMaker := map[string][]hackatime.Span{}
+	recordingSpansByMaker := map[string]map[string][]hackatime.Span{}
 	// Per-file coding time, summed over everyone on the ship. Left nil unless at least
 	// one person's capture came from the heartbeats walk, which is the only source that
 	// carries file identity: nil means unknown, never "no files".
@@ -263,7 +315,7 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 			if !tracked {
 				continue
 			}
-			ht := p.Hackatime.FetchProjectSpansWindow(ctx, uid, projects, float64(startMs)/1000, float64(endMs)/1000)
+			ht := p.Hackatime.FetchProjectSpansWindow(ctx, uid, projects, float64(startMs)/1000, float64(endMs)/1000, creditedClipIdsByMaker[makerId])
 			if !ht.OK {
 				htOk = false
 			}
@@ -274,6 +326,13 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 					notes = append(notes, note)
 				}
 			}
+			if ht.LapseExcludedSeconds > 0 {
+				lapseNote := fmt.Sprintf("lapse_heartbeats_excluded_%dm", jsRound(ht.LapseExcludedSeconds/60))
+				if collab {
+					lapseNote += ":" + makerId
+				}
+				notes = append(notes, lapseNote)
+			}
 			if ht.AiDiscountedSeconds > 0 {
 				aiDiscountedSeconds += ht.AiDiscountedSeconds
 				aiNote := fmt.Sprintf("ai_coding_discounted_%dm", jsRound(ht.AiDiscountedSeconds/60))
@@ -283,6 +342,9 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 				notes = append(notes, aiNote)
 			}
 			spansByMaker[makerId] = ht.Spans
+			if ht.LapseRecordingSpans != nil {
+				recordingSpansByMaker[makerId] = ht.LapseRecordingSpans
+			}
 			spanOrder = append(spanOrder, makerId)
 			if ht.EntitySeconds != nil {
 				if entitySeconds == nil {
@@ -323,57 +385,28 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 		notes = append(notes, "no_commits_no_timeline_range")
 	}
 
-	// Lapse clips per person x declared project, fetched BEFORE the accounting so
-	// each clip's wall-clock interval is subtracted out of the person's spans.
-	// Lapse serves a project's whole recording history with no window of its own,
-	// so the tracking window has to gate the clips here: [trackFrom, submission),
-	// the same half-open shape the heartbeat walk uses. Without it an update ship
-	// re-credits every clip a prior approval already paid for.
-	type ownedClip struct {
-		clip    lapse.Clip
-		makerId string
-		project string
-	}
-	var clips []ownedClip
-	clipsOutOfWindow := 0
-	lapseAttempted := len(htIdByMakerId) > 0 && len(projects) > 0
-	lapseOk := true
-	if lapseAttempted {
-		for _, pers := range people {
-			uid, tracked := htIdByMakerId[pers.makerId]
-			if !tracked {
-				continue
-			}
-			for _, key := range projects {
-				r := p.Lapse.FetchClips(ctx, uid, key)
-				if !r.OK {
-					lapseOk = false
-				}
-				for _, clip := range r.Clips {
-					at := clip.CreatedAt.UnixMilli()
-					if at < trackFromMs || at >= trackUntilMs {
-						clipsOutOfWindow++
-						continue
-					}
-					clips = append(clips, ownedClip{clip: clip, makerId: pers.makerId, project: key})
-				}
-			}
-		}
-	}
 	if clipsOutOfWindow > 0 {
 		notes = append(notes, fmt.Sprintf("clips_outside_tracking_window_%d", clipsOutOfWindow))
 	}
 
 	lapseByMakerProject := map[string]map[string][]lapse.Interval{}
 	for _, oc := range clips {
-		start := float64(oc.clip.CreatedAt.UnixMilli()) / 1000
-		if !(start > 0) || oc.clip.DurationSeconds <= 0 {
-			continue // malformed clips keep their lapse credit but are not subtracted from spans
-		}
 		byProject := lapseByMakerProject[oc.makerId]
 		if byProject == nil {
 			byProject = map[string][]lapse.Interval{}
 			lapseByMakerProject[oc.makerId] = byProject
+		}
+		// the synced beats say when the recording really ran; the createdAt window is
+		// only a guess, kept for clips Hackatime holds no beats for
+		if recorded := recordingSpansByMaker[oc.makerId][oc.clip.ExternalId]; oc.clip.ExternalId != "" && len(recorded) > 0 {
+			for _, span := range recorded {
+				byProject[oc.project] = append(byProject[oc.project], lapse.Interval{Start: span.StartTime, End: span.EndTime})
+			}
+			continue
+		}
+		start := float64(oc.clip.CreatedAt.UnixMilli()) / 1000
+		if !(start > 0) || oc.clip.DurationSeconds <= 0 {
+			continue // malformed clips keep their lapse credit but are not subtracted from spans
 		}
 		byProject[oc.project] = append(byProject[oc.project], lapse.Interval{Start: start, End: start + oc.clip.DurationSeconds})
 	}
@@ -401,8 +434,8 @@ func (p *Pipeline) capture(ctx context.Context, submissionId string, settle bool
 	unpinnedSecondsByMaker := map[string]float64{}
 	lapseDedupedSeconds := 0.0
 	// Per-day, per-project coding time for the review-screen heatmap. Built from the
-	// raw verified Hackatime spans (before lapse dedup) so it reflects pure tracked
-	// coding time; UTC-day buckets, aggregated across all makers on collab ships.
+	// verified Hackatime spans before the clip window subtraction (beats Lapse synced
+	// for a credited clip are already out) so it reflects pure tracked coding time; UTC-day buckets, aggregated across all makers on collab ships.
 	heatmapSec := map[string]map[string]float64{}
 	// Per-day, per-5min (UTC) coding time for the day-detail heatmap. Slot index is
 	// 0-287 (hour*12 + minute/5). The UI aggregates these up to 30-min blocks for the
